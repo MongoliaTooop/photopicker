@@ -1,0 +1,45 @@
+{
+  "name": "photopicker",
+  "version": "1.0.0",
+  "description": "摄影师选片辅助工具 - JPG浏览选片 + RAW文件匹配导出",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build-win": "electron-builder --win",
+    "build-mac": "electron-builder --mac",
+    "build-all": "electron-builder --win --mac"
+  },
+  "build": {
+    "appId": "com.photopicker.app",
+    "productName": "选片助手",
+    "directories": {
+      "output": "dist"
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "icon": "assets/icon.ico"
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ],
+      "icon": "assets/icon.icns"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "src/**/*"
+    ]
+  },
+  "author": "选片助手",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^43.1.0",
+    "electron-builder": "^26.15.3"
+  },
+  "dependencies": {
+    "exifr": "^7.1.3"
+  }
+}

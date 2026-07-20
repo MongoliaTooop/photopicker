@@ -1,0 +1,11 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+Thumbs.db
+
+# Exclude desktop (Electron) version — only web version is deployed
+main.js
+preload.js
+src/
+assets/

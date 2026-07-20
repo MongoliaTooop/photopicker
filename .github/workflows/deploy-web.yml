@@ -1,0 +1,39 @@
+name: 部署网页版到 GitHub Pages
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'web/**'
+      - '.github/workflows/deploy-web.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 配置 GitHub Pages
+        uses: actions/configure-pages@v4
+
+      - name: 上传 web/ 目录
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./web
+
+      - name: 部署
+        id: deployment
+        uses: actions/deploy-pages@v4
