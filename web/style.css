@@ -601,6 +601,7 @@ body {
 .status-red { color: var(--color-deleted); }
 .status-muted { color: var(--text-muted); }
 .status-hint { color: var(--text-dim); font-size: 10px; }
+.status-version { color: var(--text-dim); font-size: 10px; opacity: 0.5; }
 
 /* ===== Dialogs ===== */
 .dialog-overlay {
