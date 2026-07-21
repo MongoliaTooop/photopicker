@@ -45,6 +45,9 @@
         <button class="btn" id="btn-filter" title="按状态筛选">
           <span class="icon">🔍</span> 筛选
         </button>
+        <button class="btn" id="btn-settings" title="预览设置">
+          <span class="icon">⚙</span> 设置
+        </button>
       </div>
       <div class="toolbar-center">
         <span id="toolbar-title" class="toolbar-title">选片助手</span>
@@ -66,6 +69,13 @@
         <div class="panel-header">
           <span>缩略图</span>
           <span id="thumb-count" class="badge">0</span>
+        </div>
+        <!-- 缩略图生成进度条 -->
+        <div class="thumb-gen-progress" id="thumb-gen-progress" style="display:none;">
+          <div class="thumb-gen-bar-container">
+            <div class="thumb-gen-bar" id="thumb-gen-bar" style="width:0%;"></div>
+          </div>
+          <span class="thumb-gen-text" id="thumb-gen-text">生成缩略图 0/0</span>
         </div>
         <div class="thumb-list" id="thumb-list">
           <div class="empty-state" id="empty-state">
@@ -90,6 +100,7 @@
             <button class="nav-btn" id="btn-next" title="下一张（→ / 空格）">→</button>
           </div>
           <div class="preview-zoom">
+            <button class="zoom-btn" id="btn-view-original" title="查看原图" style="display:none;">查看原图</button>
             <button class="zoom-btn" id="btn-zoom-in" title="放大（+）">+</button>
             <button class="zoom-btn" id="btn-zoom-out" title="缩小（-）">-</button>
             <button class="zoom-btn" id="btn-zoom-fit" title="适应窗口（0）">适应</button>
@@ -107,6 +118,14 @@
           <div class="info-row">
             <span class="info-label">文件名</span>
             <span class="info-value" id="info-filename">-</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">图片体积</span>
+            <span class="info-value" id="info-filesize">-</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">缩略图体积</span>
+            <span class="info-value" id="info-thumbsize">-</span>
           </div>
           <div class="info-row">
             <span class="info-label">相机</span>
@@ -227,6 +246,40 @@
         <button class="btn btn-primary" id="btn-export-done" style="display:none; margin-top:12px;">完成</button>
       </div>
     </div>
+  </div>
+
+  <!-- 设置对话框 -->
+  <div class="dialog-overlay" id="dialog-settings" style="display:none;">
+    <div class="dialog">
+      <div class="dialog-header">
+        <h2>预览设置</h2>
+        <button class="dialog-close" id="dialog-settings-close">&times;</button>
+      </div>
+      <div class="dialog-body">
+        <div class="dialog-step">
+          <label class="step-label">预览压缩比</label>
+          <div style="display:flex; align-items:center; gap:8px; margin-bottom:8px;">
+            <input type="number" id="settings-compression" min="1" max="100" value="100"
+                   style="width:80px; padding:6px 10px; background:var(--bg-tertiary); border:1px solid var(--border); border-radius:var(--radius-sm); color:var(--text-primary); font-size:13px;" />
+            <span style="color:var(--text-secondary); font-size:13px;">%</span>
+          </div>
+          <div class="step-hint" style="color:var(--text-muted); font-size:11px; line-height:1.6;">
+            范围 1-100，默认 100%（原图）。<br>
+            低于 100% 时，预览图按比例压缩后显示，加载更快。<br>
+            压缩预览时右上角会出现「查看原图」按钮，可随时查看未压缩原图。
+          </div>
+        </div>
+        <div class="dialog-step">
+          <button class="btn btn-primary" id="btn-settings-save">保存设置</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 原图查看浮层 -->
+  <div class="original-overlay" id="original-overlay" style="display:none;">
+    <div class="original-overlay-close" id="original-overlay-close">&times;</div>
+    <img id="original-overlay-img" class="original-overlay-img" />
   </div>
 
   <!-- 排序下拉菜单 -->

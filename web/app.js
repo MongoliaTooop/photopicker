@@ -1,16 +1,28 @@
 /* ===== 选片助手 - 网页版核心逻辑 =====
  * 使用 File System Access API 读取本地文件夹
  * 支持 Chrome / Edge / Brave 等 Chromium 内核浏览器
+ * 
+ * v2.0 更新：
+ * - 缩略图压缩生成（长边800px，写入「缩略图」子文件夹）
+ * - 预览压缩设置（1-100%可调，<100%显示查看原图）
+ * - 分页加载（每次100张，剩余≤15张自动加载）
+ * - 文件信息增加图片体积和缩略图体积
  */
 
 const RAW_EXTENSIONS = ['.cr2', '.cr3', '.nef', '.arw', '.raf', '.dng', '.rw2', '.orf', '.x3f', '.sr2', '.srf', '.pef'];
 const JPG_EXTENSIONS = ['.jpg', '.jpeg'];
+const THUMB_MAX_EDGE = 800;
+const THUMB_QUALITY = 0.7;
+const PAGE_SIZE = 100;
+const LOAD_THRESHOLD_PX = 700; // 约15个缩略图项的高度
 
 // 状态
 const state = {
-  jpgDirHandle: null,     // JPG文件夹句柄
-  rawDirHandle: null,     // RAW文件夹句柄
-  jpgFiles: [],           // [{ name, baseName, handle, url, exifTime }]
+  jpgDirHandle: null,
+  rawDirHandle: null,
+  thumbDirHandle: null,      // 缩略图文件夹句柄
+  canWrite: false,            // 是否有读写权限
+  jpgFiles: [],
   currentIndex: -1,
   marks: {},
   groups: [],
@@ -20,7 +32,19 @@ const state = {
   displayList: [],
   matchedData: null,
   zoomLevel: 1,
-  urlCache: new Map(),    // 缓存 objectURL 防止重复创建
+  urlCache: new Map(),
+  thumbUrlCache: new Map(),   // 缩略图URL缓存
+  thumbGenInProgress: new Map(), // 正在生成的缩略图
+  thumbGenTotal: 0,
+  thumbGenDone: 0,
+  // 分页
+  renderPlan: [],
+  planCursor: 0,
+  _currentGroupContent: null,
+  _currentSubContent: null,
+  // 预览压缩
+  previewCompression: parseInt(localStorage.getItem('previewCompression') || '100'),
+  currentCompressedUrl: null,
 };
 
 // DOM 引用
@@ -55,6 +79,8 @@ function init() {
   bindActions();
   bindDialogs();
   bindDropdowns();
+  bindScrollPagination();
+  bindSettings();
   updateStats();
 }
 
@@ -96,8 +122,28 @@ function bindToolbar() {
 // ===== 打开JPG文件夹 =====
 async function openJpgFolder() {
   try {
-    const dirHandle = await window.showDirectoryPicker({ mode: 'read' });
+    // 请求读写权限（用于创建缩略图文件夹）
+    let dirHandle;
+    try {
+      dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+      state.canWrite = true;
+    } catch (e) {
+      if (e.name === 'AbortError') throw e;
+      // 读写权限被拒绝，尝试只读
+      dirHandle = await window.showDirectoryPicker({ mode: 'read' });
+      state.canWrite = false;
+    }
     state.jpgDirHandle = dirHandle;
+
+    // 创建/获取缩略图文件夹
+    state.thumbDirHandle = null;
+    if (state.canWrite) {
+      try {
+        state.thumbDirHandle = await dirHandle.getDirectoryHandle('缩略图', { create: true });
+      } catch (e) {
+        console.warn('创建缩略图文件夹失败，将使用内存缩略图:', e);
+      }
+    }
 
     // 扫描JPG文件
     const jpgFiles = [];
@@ -124,9 +170,12 @@ async function openJpgFolder() {
     // 按文件名排序
     jpgFiles.sort((a, b) => a.name.localeCompare(b.name));
 
-    // 清理旧的 objectURL
+    // 清理旧的缓存
     state.urlCache.forEach(url => URL.revokeObjectURL(url));
     state.urlCache.clear();
+    state.thumbUrlCache.forEach(url => URL.revokeObjectURL(url));
+    state.thumbUrlCache.clear();
+    state.thumbGenInProgress.clear();
 
     state.jpgFiles = jpgFiles;
     state.marks = {};
@@ -140,8 +189,12 @@ async function openJpgFolder() {
     navigateTo(0);
     updateStats();
 
-    // 后台异步加载所有EXIF（用于分组功能）
+    // 后台异步加载所有EXIF
     loadAllExif();
+
+    // 后台生成缩略图
+    generateAllThumbnails();
+
   } catch (err) {
     if (err.name !== 'AbortError') {
       console.error('打开文件夹失败:', err);
@@ -156,7 +209,7 @@ async function loadAllExif() {
   for (let i = 0; i < state.jpgFiles.length; i += BATCH_SIZE) {
     const batch = state.jpgFiles.slice(i, i + BATCH_SIZE);
     await Promise.all(batch.map(async (file) => {
-      if (file.exifTime !== null) return; // 已加载
+      if (file.exifTime !== null) return;
       try {
         const f = await file.handle.getFile();
         const exif = await exifr.parse(f, { tiff: true, exif: true });
@@ -167,7 +220,6 @@ async function loadAllExif() {
         // 忽略EXIF读取错误
       }
     }));
-    // 如果分组已开启，更新分组
     if (state.groupingEnabled && i + BATCH_SIZE >= state.jpgFiles.length) {
       autoGroup();
       updateDisplayList();
@@ -176,7 +228,24 @@ async function loadAllExif() {
   }
 }
 
-// ===== 获取图片URL（带缓存） =====
+// ===== 图片加载工具 =====
+function loadImageFromFile(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      resolve(img);
+    };
+    img.onerror = (e) => {
+      URL.revokeObjectURL(url);
+      reject(e);
+    };
+    img.src = url;
+  });
+}
+
+// ===== 获取原图URL（带缓存） =====
 async function getImageUrl(file) {
   if (state.urlCache.has(file.baseName)) {
     return state.urlCache.get(file.baseName);
@@ -187,12 +256,146 @@ async function getImageUrl(file) {
   return url;
 }
 
+// ===== 获取缩略图URL（带缓存+自动生成） =====
+async function getThumbnailUrl(file) {
+  // 1. 检查URL缓存
+  if (state.thumbUrlCache.has(file.baseName)) {
+    return state.thumbUrlCache.get(file.baseName);
+  }
+
+  // 2. 检查是否正在生成
+  if (state.thumbGenInProgress.has(file.baseName)) {
+    return state.thumbGenInProgress.get(file.baseName);
+  }
+
+  // 3. 开始生成
+  const promise = generateThumbnailInternal(file);
+  state.thumbGenInProgress.set(file.baseName, promise);
+
+  try {
+    return await promise;
+  } finally {
+    state.thumbGenInProgress.delete(file.baseName);
+  }
+}
+
+async function generateThumbnailInternal(file) {
+  // 检查磁盘上是否已有缩略图
+  if (state.thumbDirHandle) {
+    try {
+      const thumbHandle = await state.thumbDirHandle.getFileHandle(file.name);
+      const thumbFile = await thumbHandle.getFile();
+      const url = URL.createObjectURL(thumbFile);
+      state.thumbUrlCache.set(file.baseName, url);
+      return url;
+    } catch (e) {
+      // 不存在，继续生成
+    }
+  }
+
+  // 生成缩略图
+  try {
+    const origFile = await file.handle.getFile();
+    const img = await loadImageFromFile(origFile);
+
+    let w = img.naturalWidth;
+    let h = img.naturalHeight;
+    if (w > h) {
+      if (w > THUMB_MAX_EDGE) {
+        h = Math.round(h * THUMB_MAX_EDGE / w);
+        w = THUMB_MAX_EDGE;
+      }
+    } else {
+      if (h > THUMB_MAX_EDGE) {
+        w = Math.round(w * THUMB_MAX_EDGE / h);
+        h = THUMB_MAX_EDGE;
+      }
+    }
+
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+
+    const blob = await new Promise(r => canvas.toBlob(r, 'image/jpeg', THUMB_QUALITY));
+
+    // 尝试写入磁盘
+    if (state.thumbDirHandle) {
+      try {
+        const thumbHandle = await state.thumbDirHandle.getFileHandle(file.name, { create: true });
+        const writable = await thumbHandle.createWritable();
+        await writable.write(blob);
+        await writable.close();
+      } catch (e) {
+        // 写入失败，仅使用内存中的缩略图
+      }
+    }
+
+    const url = URL.createObjectURL(blob);
+    state.thumbUrlCache.set(file.baseName, url);
+    return url;
+  } catch (e) {
+    // 生成失败，回退到原图
+    return await getImageUrl(file);
+  }
+}
+
+// ===== 后台批量生成所有缩略图 =====
+async function generateAllThumbnails() {
+  state.thumbGenTotal = state.jpgFiles.length;
+  state.thumbGenDone = 0;
+
+  const $progress = document.getElementById('thumb-gen-progress');
+  if ($progress) $progress.style.display = 'flex';
+  updateThumbGenProgress();
+
+  const BATCH = 5;
+  for (let i = 0; i < state.jpgFiles.length; i += BATCH) {
+    const batch = state.jpgFiles.slice(i, i + BATCH);
+    await Promise.all(batch.map(async (file) => {
+      try {
+        await getThumbnailUrl(file);
+      } catch (e) {
+        // 忽略
+      }
+      state.thumbGenDone++;
+    }));
+    updateThumbGenProgress();
+    // 让出UI线程
+    await new Promise(r => setTimeout(r, 0));
+  }
+
+  // 延迟隐藏进度条
+  setTimeout(() => {
+    const $p = document.getElementById('thumb-gen-progress');
+    if ($p) $p.style.display = 'none';
+  }, 1000);
+}
+
+function updateThumbGenProgress() {
+  const $bar = document.getElementById('thumb-gen-bar');
+  const $text = document.getElementById('thumb-gen-text');
+  if (!$bar || !$text) return;
+  const pct = state.thumbGenTotal > 0 ? Math.round(state.thumbGenDone / state.thumbGenTotal * 100) : 0;
+  $bar.style.width = pct + '%';
+  $text.textContent = `生成缩略图 ${state.thumbGenDone}/${state.thumbGenTotal}`;
+}
+
 // ===== 键盘快捷键 =====
 function bindKeyboard() {
   document.addEventListener('keydown', (e) => {
-    if (document.querySelector('.dialog-overlay[style*="display: flex"]') ||
-        document.querySelector('.dialog-overlay[style*="display:block"]')) {
-      if (e.key === 'Escape') closeAllDialogs();
+    // 检查对话框/浮层是否打开
+    const hasOpenDialog = document.querySelector('.dialog-overlay[style*="display: flex"]') ||
+                          document.querySelector('.dialog-overlay[style*="display:block"]');
+    const hasOpenOverlay = document.getElementById('original-overlay') &&
+                           document.getElementById('original-overlay').style.display === 'flex';
+
+    if (hasOpenDialog || hasOpenOverlay) {
+      if (e.key === 'Escape') {
+        closeAllDialogs();
+        const $overlay = document.getElementById('original-overlay');
+        if ($overlay) $overlay.style.display = 'none';
+      }
       return;
     }
     if (state.displayList.length === 0) return;
@@ -296,6 +499,61 @@ function bindDropdowns() {
   });
 }
 
+// ===== 设置 =====
+function bindSettings() {
+  document.getElementById('btn-settings').addEventListener('click', () => {
+    document.getElementById('dialog-settings').style.display = 'flex';
+    document.getElementById('settings-compression').value = state.previewCompression;
+  });
+
+  document.getElementById('dialog-settings-close').addEventListener('click', () => {
+    document.getElementById('dialog-settings').style.display = 'none';
+  });
+
+  document.getElementById('btn-settings-save').addEventListener('click', () => {
+    let val = parseInt(document.getElementById('settings-compression').value);
+    if (isNaN(val) || val < 1) val = 1;
+    if (val > 100) val = 100;
+    state.previewCompression = val;
+    localStorage.setItem('previewCompression', String(val));
+    document.getElementById('dialog-settings').style.display = 'none';
+
+    // 用新压缩比重新加载当前预览
+    if (state.currentIndex >= 0) {
+      navigateTo(state.currentIndex);
+    }
+  });
+
+  // 查看原图按钮
+  document.getElementById('btn-view-original').addEventListener('click', async () => {
+    if (state.currentIndex < 0) return;
+    const file = state.displayList[state.currentIndex];
+    const overlay = document.getElementById('original-overlay');
+    const overlayImg = document.getElementById('original-overlay-img');
+
+    overlay.style.display = 'flex';
+    overlayImg.src = '';
+
+    try {
+      const url = await getImageUrl(file);
+      overlayImg.src = url;
+    } catch (e) {
+      console.error('加载原图失败:', e);
+    }
+  });
+
+  // 关闭原图浮层
+  document.getElementById('original-overlay-close').addEventListener('click', () => {
+    document.getElementById('original-overlay').style.display = 'none';
+  });
+
+  document.getElementById('original-overlay').addEventListener('click', (e) => {
+    if (e.target.id === 'original-overlay') {
+      document.getElementById('original-overlay').style.display = 'none';
+    }
+  });
+}
+
 // ===== 对话框 =====
 function bindDialogs() {
   document.getElementById('dialog-match-close').addEventListener('click', () => {
@@ -306,6 +564,7 @@ function bindDialogs() {
 function closeAllDialogs() {
   document.getElementById('dialog-match').style.display = 'none';
   document.getElementById('dialog-export').style.display = 'none';
+  document.getElementById('dialog-settings').style.display = 'none';
   document.querySelectorAll('.dropdown').forEach(d => d.style.display = 'none');
 }
 
@@ -352,9 +611,62 @@ function updateDisplayList() {
   state.displayList = list;
 }
 
-// ===== 渲染缩略图 =====
+// ===== 渲染缩略图（分页加载） =====
+
+function buildRenderPlan() {
+  const plan = [];
+
+  if (state.groupingEnabled && state.groups.length > 0) {
+    state.groups.forEach(group => {
+      plan.push({ type: 'group-header', group });
+
+      if (group.subgroups.length > 0) {
+        group.subgroups.forEach(sub => {
+          plan.push({ type: 'subgroup-header', subgroup: sub });
+          sub.files.forEach(file => {
+            const idx = state.displayList.indexOf(file);
+            if (idx >= 0) {
+              plan.push({ type: 'thumb', file, index: idx });
+            }
+          });
+        });
+      } else {
+        group.files.forEach(file => {
+          const idx = state.displayList.indexOf(file);
+          if (idx >= 0) {
+            plan.push({ type: 'thumb', file, index: idx });
+          }
+        });
+      }
+    });
+
+    // 未分组
+    const ungrouped = state.displayList.filter(f =>
+      !state.groups.some(g => g.files.includes(f))
+    );
+    if (ungrouped.length > 0) {
+      plan.push({ type: 'group-header', group: { name: '未分组', files: ungrouped, _ungrouped: true } });
+      ungrouped.forEach(file => {
+        const idx = state.displayList.indexOf(file);
+        plan.push({ type: 'thumb', file, index: idx });
+      });
+    }
+  } else {
+    state.displayList.forEach((file, idx) => {
+      plan.push({ type: 'thumb', file, index: idx });
+    });
+  }
+
+  return plan;
+}
+
 function renderThumbnails() {
   $thumbList.innerHTML = '';
+  state.renderPlan = buildRenderPlan();
+  state.planCursor = 0;
+  state._currentGroupContent = null;
+  state._currentSubContent = null;
+
   $thumbCount.textContent = state.displayList.length;
 
   if (state.displayList.length === 0) {
@@ -364,90 +676,97 @@ function renderThumbnails() {
   }
 
   $emptyState.style.display = 'none';
+  loadMoreThumbs();
+}
 
-  if (state.groupingEnabled && state.groups.length > 0) {
-    renderGroupedThumbnails();
-  } else {
-    renderFlatThumbnails();
+function loadMoreThumbs() {
+  let thumbsAdded = 0;
+
+  while (state.planCursor < state.renderPlan.length && thumbsAdded < PAGE_SIZE) {
+    const item = state.renderPlan[state.planCursor];
+
+    if (item.type === 'group-header') {
+      const header = document.createElement('div');
+      header.className = 'group-header';
+      const isUngrouped = item.group._ungrouped;
+      header.innerHTML = `<span class="group-dot" ${isUngrouped ? 'style="background:var(--color-pending);"' : ''}></span>
+        <span>${item.group.name}</span>
+        <span class="group-count">${item.group.files.length}</span>
+        ${!isUngrouped ? '<span class="group-expand">▼</span>' : ''}`;
+
+      if (!isUngrouped) {
+        header.addEventListener('click', () => {
+          const content = header.nextElementSibling;
+          if (content) {
+            const isHidden = content.style.display === 'none';
+            content.style.display = isHidden ? 'block' : 'none';
+            header.querySelector('.group-expand').textContent = isHidden ? '▼' : '▶';
+          }
+        });
+      }
+      $thumbList.appendChild(header);
+
+      const content = document.createElement('div');
+      $thumbList.appendChild(content);
+      state._currentGroupContent = content;
+      state._currentSubContent = null;
+
+    } else if (item.type === 'subgroup-header') {
+      const subHeader = document.createElement('div');
+      subHeader.className = 'subgroup-header';
+      subHeader.innerHTML = `<span>▼</span> ${item.subgroup.name} (${item.subgroup.files.length})`;
+      subHeader.addEventListener('click', () => {
+        const subContent = subHeader.nextElementSibling;
+        if (subContent) {
+          const isHidden = subContent.style.display === 'none';
+          subContent.style.display = isHidden ? 'block' : 'none';
+        }
+      });
+      state._currentGroupContent.appendChild(subHeader);
+
+      const subContent = document.createElement('div');
+      state._currentGroupContent.appendChild(subContent);
+      state._currentSubContent = subContent;
+
+    } else if (item.type === 'thumb') {
+      const el = createThumbItem(item.file, item.index);
+      if (state._currentSubContent) {
+        state._currentSubContent.appendChild(el);
+      } else if (state._currentGroupContent) {
+        state._currentGroupContent.appendChild(el);
+      } else {
+        $thumbList.appendChild(el);
+      }
+      thumbsAdded++;
+    }
+
+    state.planCursor++;
   }
 }
 
-function renderFlatThumbnails() {
-  state.displayList.forEach((file, i) => {
-    const el = createThumbItem(file, i);
-    $thumbList.appendChild(el);
+// ===== 滚动分页监听 =====
+function bindScrollPagination() {
+  $thumbList.addEventListener('scroll', () => {
+    if (state.planCursor >= state.renderPlan.length) return;
+
+    const { scrollTop, scrollHeight, clientHeight } = $thumbList;
+    const remaining = scrollHeight - scrollTop - clientHeight;
+
+    // 剩余约15个缩略图项高度时加载下一批
+    if (remaining < LOAD_THRESHOLD_PX) {
+      loadMoreThumbs();
+    }
   });
 }
 
-function renderGroupedThumbnails() {
-  state.groups.forEach((group) => {
-    const header = document.createElement('div');
-    header.className = 'group-header';
-    header.innerHTML = `<span class="group-dot"></span>
-      <span>${group.name}</span>
-      <span class="group-count">${group.files.length}</span>
-      <span class="group-expand">▼</span>`;
-    header.addEventListener('click', () => {
-      const content = header.nextElementSibling;
-      if (content) {
-        const isHidden = content.style.display === 'none';
-        content.style.display = isHidden ? 'block' : 'none';
-        header.querySelector('.group-expand').textContent = isHidden ? '▼' : '▶';
-      }
-    });
-    $thumbList.appendChild(header);
+// ===== 确保目标缩略图已加载 =====
+function ensureThumbLoaded(targetIndex) {
+  const existing = document.querySelector(`.thumb-item[data-index="${targetIndex}"]`);
+  if (existing) return;
 
-    const groupContent = document.createElement('div');
-
-    if (group.subgroups.length > 0) {
-      group.subgroups.forEach((sub) => {
-        const subHeader = document.createElement('div');
-        subHeader.className = 'subgroup-header';
-        subHeader.innerHTML = `<span>▼</span> ${sub.name} (${sub.files.length})`;
-        subHeader.addEventListener('click', () => {
-          const subContent = subHeader.nextElementSibling;
-          if (subContent) {
-            const isHidden = subContent.style.display === 'none';
-            subContent.style.display = isHidden ? 'block' : 'none';
-          }
-        });
-        groupContent.appendChild(subHeader);
-
-        const subContent = document.createElement('div');
-        sub.files.forEach((file) => {
-          const idx = state.displayList.indexOf(file);
-          if (idx >= 0) subContent.appendChild(createThumbItem(file, idx));
-        });
-        groupContent.appendChild(subContent);
-      });
-    } else {
-      group.files.forEach((file) => {
-        const idx = state.displayList.indexOf(file);
-        if (idx >= 0) groupContent.appendChild(createThumbItem(file, idx));
-      });
-    }
-
-    $thumbList.appendChild(groupContent);
-  });
-
-  // 未分组的文件
-  const ungrouped = state.displayList.filter(f => {
-    return !state.groups.some(g => g.files.includes(f));
-  });
-  if (ungrouped.length > 0) {
-    const header = document.createElement('div');
-    header.className = 'group-header';
-    header.innerHTML = `<span class="group-dot" style="background:var(--color-pending);"></span>
-      <span>未分组</span>
-      <span class="group-count">${ungrouped.length}</span>`;
-    $thumbList.appendChild(header);
-
-    const content = document.createElement('div');
-    ungrouped.forEach((file) => {
-      const idx = state.displayList.indexOf(file);
-      content.appendChild(createThumbItem(file, idx));
-    });
-    $thumbList.appendChild(content);
+  while (state.planCursor < state.renderPlan.length) {
+    loadMoreThumbs();
+    if (document.querySelector(`.thumb-item[data-index="${targetIndex}"]`)) break;
   }
 }
 
@@ -462,9 +781,9 @@ function createThumbItem(file, index) {
     <span class="thumb-name">${file.name}</span>
     <span class="thumb-dot ${mark === 'selected' ? 'green' : mark === 'deleted' ? 'red' : 'yellow'}"></span>`;
 
-  // 异步加载缩略图
+  // 异步加载缩略图（非原图）
   const imgEl = el.querySelector('.thumb-img');
-  getImageUrl(file).then(url => {
+  getThumbnailUrl(file).then(url => {
     if (imgEl) imgEl.src = url;
   });
 
@@ -479,17 +798,32 @@ async function navigateTo(index) {
   state.currentIndex = index;
   const file = state.displayList[index];
 
+  // 确保目标缩略图已渲染
+  ensureThumbLoaded(index);
+
+  // 回收上一个压缩预览URL
+  if (state.currentCompressedUrl) {
+    URL.revokeObjectURL(state.currentCompressedUrl);
+    state.currentCompressedUrl = null;
+  }
+
   // 更新预览图
   $previewImg.style.display = 'none';
   $previewPlaceholder.style.display = 'flex';
   try {
-    const url = await getImageUrl(file);
+    const url = await getPreviewUrl(file);
     $previewImg.src = url;
     $previewImg.style.display = 'block';
     $previewPlaceholder.style.display = 'none';
     zoomFit();
   } catch (err) {
     console.error('加载预览失败:', err);
+  }
+
+  // 显示/隐藏「查看原图」按钮
+  const $btnViewOriginal = document.getElementById('btn-view-original');
+  if ($btnViewOriginal) {
+    $btnViewOriginal.style.display = state.previewCompression < 100 ? 'flex' : 'none';
   }
 
   // 更新状态标签
@@ -509,10 +843,38 @@ async function navigateTo(index) {
 
   // 更新信息面板
   updateInfoPanel(file);
+  loadFileInfo(file);
   updateStatusBar(file);
+}
 
-  // 异步加载EXIF
-  loadExif(file);
+// ===== 获取预览图URL（按压缩设置） =====
+async function getPreviewUrl(file) {
+  if (state.previewCompression >= 100) {
+    return await getImageUrl(file);
+  }
+
+  // 压缩预览
+  try {
+    const origFile = await file.handle.getFile();
+    const img = await loadImageFromFile(origFile);
+
+    const scale = state.previewCompression / 100;
+    const w = Math.max(1, Math.round(img.naturalWidth * scale));
+    const h = Math.max(1, Math.round(img.naturalHeight * scale));
+
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+
+    const blob = await new Promise(r => canvas.toBlob(r, 'image/jpeg', 0.85));
+    const url = URL.createObjectURL(blob);
+    state.currentCompressedUrl = url;
+    return url;
+  } catch (e) {
+    // 压缩失败，回退到原图
+    return await getImageUrl(file);
+  }
 }
 
 function navigateNext() {
@@ -562,6 +924,13 @@ function updatePreviewBadge(mark) {
   $previewBadge.textContent = c.text;
 }
 
+// ===== 文件大小格式化 =====
+function formatFileSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+}
+
 // ===== 信息面板 =====
 function updateInfoPanel(file) {
   $infoDetail.style.display = 'block';
@@ -573,6 +942,8 @@ function updateInfoPanel(file) {
   document.getElementById('info-shutter').textContent = '-';
   document.getElementById('info-iso').textContent = '-';
   document.getElementById('info-date').textContent = '-';
+  document.getElementById('info-filesize').textContent = '-';
+  document.getElementById('info-thumbsize').textContent = '-';
   document.getElementById('info-group').textContent = findGroupForFile(file) || '无';
   updateInfoStatus(file);
 }
@@ -581,6 +952,30 @@ function updateInfoStatus(file) {
   const mark = state.marks[file.baseName];
   const labels = { selected: '选中（保留）', pending: '待定（未决定）', deleted: '删除（移除）' };
   document.getElementById('info-status').textContent = labels[mark] || '待定';
+}
+
+async function loadFileInfo(file) {
+  // 加载原图文件大小
+  try {
+    const f = await file.handle.getFile();
+    document.getElementById('info-filesize').textContent = formatFileSize(f.size);
+  } catch (e) {}
+
+  // 加载缩略图文件大小
+  try {
+    if (state.thumbDirHandle) {
+      const thumbHandle = await state.thumbDirHandle.getFileHandle(file.name);
+      const thumbFile = await thumbHandle.getFile();
+      document.getElementById('info-thumbsize').textContent = formatFileSize(thumbFile.size);
+    } else {
+      document.getElementById('info-thumbsize').textContent = '未生成';
+    }
+  } catch (e) {
+    document.getElementById('info-thumbsize').textContent = '未生成';
+  }
+
+  // 加载EXIF
+  await loadExif(file);
 }
 
 async function loadExif(file) {
@@ -598,9 +993,6 @@ async function loadExif(file) {
       if (exif.DateTimeOriginal) {
         const d = new Date(exif.DateTimeOriginal);
         document.getElementById('info-date').textContent = d.toLocaleString('zh-CN');
-      }
-
-      if (exif.DateTimeOriginal) {
         file.exifTime = new Date(exif.DateTimeOriginal).getTime();
       }
     }
@@ -732,7 +1124,6 @@ function openMatchDialog(selectedJpgs) {
       state.rawDirHandle = dirHandle;
       document.getElementById('match-raw-folder-info').textContent = dirHandle.name;
 
-      // 扫描RAW文件，建立 baseName → handle 映射
       const rawMap = new Map();
       for await (const entry of dirHandle.values()) {
         if (entry.kind === 'file') {
@@ -744,7 +1135,6 @@ function openMatchDialog(selectedJpgs) {
         }
       }
 
-      // 匹配
       const matched = [];
       const unmatched = [];
       selectedJpgs.forEach(jpg => {
@@ -758,12 +1148,10 @@ function openMatchDialog(selectedJpgs) {
 
       state.matchedData = { matched, unmatched };
 
-      // 显示统计
       document.getElementById('match-stats').style.display = 'flex';
       document.getElementById('match-count-matched').textContent = matched.length;
       document.getElementById('match-count-unmatched').textContent = unmatched.length;
 
-      // 显示匹配列表
       const $list = document.getElementById('match-list');
       $list.innerHTML = '';
 
@@ -793,7 +1181,6 @@ function openMatchDialog(selectedJpgs) {
     }
   };
 
-  // 导出按钮
   document.getElementById('btn-export-copy').onclick = async () => {
     if (!state.matchedData || state.matchedData.matched.length === 0) {
       alert('没有匹配的RAW文件可导出。');
@@ -827,7 +1214,6 @@ async function copyRawFiles(matchedList) {
   const total = matchedList.length;
 
   try {
-    // 选择输出文件夹（需要读写权限）
     const outDirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
 
     const success = [];
@@ -838,9 +1224,7 @@ async function copyRawFiles(matchedList) {
       $progressText.textContent = `${i} / ${total}`;
 
       try {
-        // 读取源文件
         const file = await item.raw.handle.getFile();
-        // 在目标文件夹创建文件
         const newHandle = await outDirHandle.getFileHandle(item.raw.name, { create: true });
         const writable = await newHandle.createWritable();
         await writable.write(file);
@@ -851,13 +1235,11 @@ async function copyRawFiles(matchedList) {
         failed.push({ name: item.raw.name, error: err.message });
       }
 
-      // 更新进度条
       const pct = Math.round(((i + 1) / total) * 100);
       $progressBar.style.width = pct + '%';
       $progressText.textContent = `${i + 1} / ${total}`;
     }
 
-    // 显示结果
     $progressBar.style.width = '100%';
     $progressText.textContent = `${success.length} / ${total}`;
 
