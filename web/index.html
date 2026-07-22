@@ -53,11 +53,8 @@
         <span id="toolbar-title" class="toolbar-title">选片助手</span>
       </div>
       <div class="toolbar-right">
-        <button class="btn btn-accent" id="btn-match-raw" title="匹配RAW文件">
+        <button class="btn btn-success" id="btn-match-raw" title="匹配RAW文件">
           匹配RAW
-        </button>
-        <button class="btn btn-success" id="btn-export" title="导出已选照片">
-          导出
         </button>
       </div>
     </div>
@@ -188,7 +185,7 @@
       </div>
       <div class="status-right">
         <span class="status-hint">空格 / 方向键 = 切换照片 | 1 = 选中 | 2 = 删除 | 3 = 清除 | F = 全屏</span>
-        <span class="status-version">v2.0</span>
+        <span class="status-version">v3.2</span>
       </div>
     </div>
   </div>
@@ -221,7 +218,8 @@
         <div class="dialog-step">
           <label class="step-label">第四步：导出选项</label>
           <div class="export-options">
-            <button class="btn btn-success" id="btn-export-copy">复制到文件夹</button>
+            <button class="btn btn-success" id="btn-export-copy">复制RAW到文件夹</button>
+            <button class="btn btn-success" id="btn-export-copy-both">复制JPG+RAW到文件夹</button>
             <button class="btn" id="btn-export-list">导出清单（CSV）</button>
           </div>
           <div class="step-hint" style="margin-top:8px;color:var(--text-muted);font-size:11px;">
@@ -272,6 +270,55 @@
         </div>
         <div class="dialog-step">
           <button class="btn btn-primary" id="btn-settings-save">保存设置</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 缩略图设置对话框 -->
+  <div class="dialog-overlay" id="dialog-thumb-settings" style="display:none;">
+    <div class="dialog dialog-thumb-settings">
+      <div class="dialog-header">
+        <h2>缩略图设置</h2>
+      </div>
+      <div class="dialog-body">
+        <div class="dialog-step">
+          <label class="step-label">选择缩略图尺寸</label>
+          <p class="step-hint" style="margin-bottom:16px;">较小的缩略图加载更快，较大的缩略图能看清更多细节。</p>
+          <div class="thumb-preset-grid">
+            <button class="thumb-preset active" data-size="400">
+              <span class="preset-name">快速加载</span>
+              <span class="preset-size">400px</span>
+              <span class="preset-desc">极小缩略图，秒开</span>
+            </button>
+            <button class="thumb-preset" data-size="800">
+              <span class="preset-name">平衡</span>
+              <span class="preset-size">800px</span>
+              <span class="preset-desc">推荐，够用且流畅</span>
+            </button>
+            <button class="thumb-preset" data-size="1200">
+              <span class="preset-name">清晰预览</span>
+              <span class="preset-size">1200px</span>
+              <span class="preset-desc">较大缩略图，看清细节</span>
+            </button>
+            <button class="thumb-preset thumb-preset-original" data-size="0">
+              <span class="preset-name">不压缩</span>
+              <span class="preset-size">原图</span>
+              <span class="preset-desc">使用原图，大文件夹较卡</span>
+            </button>
+          </div>
+        </div>
+        <div class="dialog-step">
+          <label class="step-label">自定义尺寸</label>
+          <div style="display:flex; align-items:center; gap:8px;">
+            <input type="number" id="thumb-custom-size" min="200" max="4000" value="800" placeholder="输入长边像素值"
+                   style="width:120px; padding:8px 12px; background:var(--surface-2); border:1px solid var(--border-default); border-radius:var(--radius-sm); color:var(--text-primary); font-size:14px; font-family:var(--font-mono); font-weight:500; outline:none;" />
+            <span style="color:var(--text-secondary); font-size:13px;">px</span>
+            <button class="btn" id="btn-thumb-apply-custom">应用自定义</button>
+          </div>
+        </div>
+        <div class="dialog-step" style="margin-bottom:0;">
+          <button class="btn btn-success btn-block" id="btn-thumb-confirm">确认并打开</button>
         </div>
       </div>
     </div>

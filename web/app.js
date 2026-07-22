@@ -2,16 +2,16 @@
  * 使用 File System Access API 读取本地文件夹
  * 支持 Chrome / Edge / Brave 等 Chromium 内核浏览器
  * 
- * v2.0 更新：
- * - 缩略图压缩生成（长边800px，写入「缩略图」子文件夹）
- * - 预览压缩设置（1-100%可调，<100%显示查看原图）
- * - 分页加载（每次100张，剩余≤15张自动加载）
- * - 文件信息增加图片体积和缩略图体积
+ * v3.1 更新：
+ * - 移除工具栏重复「导出」按钮
+ * - 匹配RAW对话框导出选项：复制RAW / 复制JPG+RAW / 导出清单CSV
+ * - 缩略图尺寸预设（400/800/1200/自定义/不压缩）
+ * - 打开文件夹时自动检测已有缩略图，无缩略图先弹设置对话框
+ * - 缩略图文件名带尺寸标记（如 IMG_001_800.jpg），兼容旧格式
  */
 
 const RAW_EXTENSIONS = ['.cr2', '.cr3', '.nef', '.arw', '.raf', '.dng', '.rw2', '.orf', '.x3f', '.sr2', '.srf', '.pef'];
 const JPG_EXTENSIONS = ['.jpg', '.jpeg'];
-const THUMB_MAX_EDGE = 800;
 const THUMB_QUALITY = 0.7;
 const PAGE_SIZE = 100;
 const LOAD_THRESHOLD_PX = 700; // 约15个缩略图项的高度
@@ -45,6 +45,10 @@ const state = {
   // 预览压缩
   previewCompression: parseInt(localStorage.getItem('previewCompression') || '100'),
   currentCompressedUrl: null,
+  // 缩略图尺寸设置
+  thumbSize: parseInt(localStorage.getItem('thumbSize') || '800'),   // 长边像素值，0=不压缩
+  thumbNoCompress: localStorage.getItem('thumbNoCompress') === 'true',
+  existingThumbSize: null,     // 从已有缩略图检测到的尺寸
 };
 
 // DOM 引用
@@ -81,6 +85,7 @@ function init() {
   bindDropdowns();
   bindScrollPagination();
   bindSettings();
+  bindThumbSettings();
   updateStats();
 }
 
@@ -109,14 +114,6 @@ function bindToolbar() {
     }
     openMatchDialog(selectedJpgs);
   });
-
-  document.getElementById('btn-export').addEventListener('click', () => {
-    if (!state.matchedData || state.matchedData.matched.length === 0) {
-      alert('请先匹配RAW文件。');
-      return;
-    }
-    openExportDialog();
-  });
 }
 
 // ===== 打开JPG文件夹 =====
@@ -132,17 +129,6 @@ async function openJpgFolder() {
       // 读写权限被拒绝，尝试只读
       dirHandle = await window.showDirectoryPicker({ mode: 'read' });
       state.canWrite = false;
-    }
-    state.jpgDirHandle = dirHandle;
-
-    // 创建/获取缩略图文件夹
-    state.thumbDirHandle = null;
-    if (state.canWrite) {
-      try {
-        state.thumbDirHandle = await dirHandle.getDirectoryHandle('缩略图', { create: true });
-      } catch (e) {
-        console.warn('创建缩略图文件夹失败，将使用内存缩略图:', e);
-      }
     }
 
     // 扫描JPG文件
@@ -167,39 +153,247 @@ async function openJpgFolder() {
       return;
     }
 
-    // 按文件名排序
     jpgFiles.sort((a, b) => a.name.localeCompare(b.name));
 
-    // 清理旧的缓存
-    state.urlCache.forEach(url => URL.revokeObjectURL(url));
-    state.urlCache.clear();
-    state.thumbUrlCache.forEach(url => URL.revokeObjectURL(url));
-    state.thumbUrlCache.clear();
-    state.thumbGenInProgress.clear();
+    // 检查是否已有缩略图
+    state.thumbDirHandle = null;
+    let hasExistingThumbs = false;
 
-    state.jpgFiles = jpgFiles;
-    state.marks = {};
-    jpgFiles.forEach(f => { state.marks[f.baseName] = 'pending'; });
+    if (state.canWrite) {
+      try {
+        const thumbDir = await dirHandle.getDirectoryHandle('缩略图');
+        state.thumbDirHandle = thumbDir;
 
-    // 更新标题
-    document.getElementById('toolbar-title').textContent = dirHandle.name + ' - 选片助手';
+        // 检测已有缩略图的尺寸
+        const detectedSize = await detectExistingThumbSize(thumbDir, jpgFiles);
+        if (detectedSize !== null) {
+          state.existingThumbSize = detectedSize;
+          state.thumbSize = detectedSize;
+          state.thumbNoCompress = false;
+          hasExistingThumbs = true;
+        }
+      } catch (e) {
+        // 缩略图文件夹不存在
+      }
+    }
 
-    updateDisplayList();
-    renderThumbnails();
-    navigateTo(0);
-    updateStats();
+    // 如果没有已有缩略图，弹出缩略图设置对话框
+    if (!hasExistingThumbs) {
+      const settings = await openThumbSettingsDialog();
+      if (settings === null) return; // 用户取消了
 
-    // 后台异步加载所有EXIF
-    loadAllExif();
+      state.thumbSize = settings.size;
+      state.thumbNoCompress = settings.noCompress;
+      localStorage.setItem('thumbSize', String(settings.size));
+      localStorage.setItem('thumbNoCompress', String(settings.noCompress));
 
-    // 后台生成缩略图
-    generateAllThumbnails();
+      // 创建缩略图文件夹（如果不压缩则不需要）
+      if (!settings.noCompress && state.canWrite) {
+        try {
+          state.thumbDirHandle = await dirHandle.getDirectoryHandle('缩略图', { create: true });
+        } catch (e) {
+          console.warn('创建缩略图文件夹失败:', e);
+        }
+      }
+
+      if (settings.noCompress) {
+        state.thumbDirHandle = null;
+      }
+    } else {
+      // 已有缩略图，确保文件夹句柄可用
+      if (!state.thumbDirHandle && state.canWrite) {
+        try {
+          state.thumbDirHandle = await dirHandle.getDirectoryHandle('缩略图', { create: true });
+        } catch (e) {}
+      }
+    }
+
+    // 加载文件夹内容
+    loadFolderContent(dirHandle, jpgFiles);
 
   } catch (err) {
     if (err.name !== 'AbortError') {
       console.error('打开文件夹失败:', err);
       alert('打开文件夹失败: ' + err.message);
     }
+  }
+}
+
+// ===== 检测已有缩略图尺寸 =====
+async function detectExistingThumbSize(thumbDir, jpgFiles) {
+  // 从缩略图文件夹中扫描文件名，检测尺寸后缀
+  let detectedSize = null;
+  let fileCount = 0;
+
+  for await (const entry of thumbDir.values()) {
+    if (entry.kind === 'file') {
+      fileCount++;
+      // 新格式：basename_Npx.ext → 提取 N
+      const sizeMatch = entry.name.match(/_(\d+)\.[^.]+$/);
+      if (sizeMatch) {
+        const size = parseInt(sizeMatch[1]);
+        if (detectedSize === null) detectedSize = size;
+        else if (detectedSize !== size) {
+          // 混合尺寸，取最常见的（简化：取第一个）
+          break;
+        }
+      } else {
+        // 旧格式：直接用原文件名，假定 800px
+        const ext = entry.name.toLowerCase().match(/\.[^.]+$/)?.[0] || '';
+        if (JPG_EXTENSIONS.includes(ext)) {
+          if (detectedSize === null) detectedSize = 800;
+        }
+      }
+      // 只检查前几个文件即可确定尺寸
+      if (fileCount >= 5) break;
+    }
+  }
+
+  return fileCount > 0 ? detectedSize : null;
+}
+
+// ===== 缩略图文件名格式 =====
+function getThumbFileName(baseName, originalName, thumbSize) {
+  if (thumbSize === 800) {
+    // 800px 兼容旧格式（直接用原文件名），也支持新格式
+    // 优先使用新格式，但查找时兼容旧格式
+    return `${baseName}_${thumbSize}.jpg`;
+  }
+  return `${baseName}_${thumbSize}.jpg`;
+}
+
+// ===== 打开缩略图设置对话框 =====
+function openThumbSettingsDialog() {
+  return new Promise((resolve) => {
+    const $dialog = document.getElementById('dialog-thumb-settings');
+    $dialog.style.display = 'flex';
+
+    // 设置当前选中状态
+    const presets = $dialog.querySelectorAll('.thumb-preset');
+    presets.forEach(p => p.classList.remove('active'));
+
+    if (state.thumbNoCompress) {
+      $dialog.querySelector('.thumb-preset-original').classList.add('active');
+    } else {
+      const matchingPreset = $dialog.querySelector(`.thumb-preset[data-size="${state.thumbSize}"]`);
+      if (matchingPreset) {
+        matchingPreset.classList.add('active');
+      }
+    }
+
+    // 确认按钮
+    const confirmBtn = document.getElementById('btn-thumb-confirm');
+    const onConfirm = () => {
+      const activePreset = $dialog.querySelector('.thumb-preset.active');
+      let size, noCompress;
+
+      if (activePreset) {
+        size = parseInt(activePreset.dataset.size);
+        noCompress = size === 0;
+      } else {
+        size = parseInt(document.getElementById('thumb-custom-size').value) || 800;
+        noCompress = false;
+      }
+
+      if (!noCompress && (size < 200 || size > 4000)) {
+        alert('自定义尺寸范围：200-4000px');
+        return;
+      }
+
+      cleanup();
+      resolve({ size, noCompress });
+    };
+
+    // ESC 取消处理 — 监听键盘事件
+    const onKeydown = (e) => {
+      if (e.key === 'Escape') {
+        cleanup();
+        resolve(null);
+      }
+    };
+
+    // 清理函数
+    const cleanup = () => {
+      $dialog.style.display = 'none';
+      confirmBtn.removeEventListener('click', onConfirm);
+      document.removeEventListener('keydown', onKeydown);
+    };
+
+    confirmBtn.addEventListener('click', onConfirm);
+    // 注意：只在对话框可见时监听ESC，避免和主键盘监听冲突
+    // 主键盘监听器已有ESC处理，但Promise模式需要单独的resolve
+    // 方案：给对话框添加一个隐藏的取消按钮
+    // 实际上，closeAllDialogs()已经会关闭dialog-thumb-settings
+    // 但Promise需要resolve(null)，所以在键盘监听里也要处理
+    document.addEventListener('keydown', onKeydown);
+  });
+}
+
+// ===== 缩略图设置对话框交互 =====
+function bindThumbSettings() {
+  const $dialog = document.getElementById('dialog-thumb-settings');
+  const presets = $dialog.querySelectorAll('.thumb-preset');
+
+  // 预设按钮点击
+  presets.forEach(preset => {
+    preset.addEventListener('click', () => {
+      presets.forEach(p => p.classList.remove('active'));
+      preset.classList.add('active');
+
+      const size = parseInt(preset.dataset.size);
+      if (size > 0) {
+        document.getElementById('thumb-custom-size').value = size;
+      }
+    });
+  });
+
+  // 自定义尺寸输入 + 应用按钮
+  document.getElementById('btn-thumb-apply-custom').addEventListener('click', () => {
+    let val = parseInt(document.getElementById('thumb-custom-size').value);
+    if (isNaN(val) || val < 200) val = 200;
+    if (val > 4000) val = 4000;
+    document.getElementById('thumb-custom-size').value = val;
+
+    // 取消预设选中，标记为自定义
+    presets.forEach(p => p.classList.remove('active'));
+
+    // 如果自定义值等于某个预设值，自动选中那个预设
+    const matchingPreset = $dialog.querySelector(`.thumb-preset[data-size="${val}"]`);
+    if (matchingPreset) {
+      matchingPreset.classList.add('active');
+    }
+  });
+}
+
+// ===== 加载文件夹内容（从openJpgFolder提取） =====
+function loadFolderContent(dirHandle, jpgFiles) {
+  state.jpgDirHandle = dirHandle;
+
+  // 清理旧的缓存
+  state.urlCache.forEach(url => URL.revokeObjectURL(url));
+  state.urlCache.clear();
+  state.thumbUrlCache.forEach(url => URL.revokeObjectURL(url));
+  state.thumbUrlCache.clear();
+  state.thumbGenInProgress.clear();
+
+  state.jpgFiles = jpgFiles;
+  state.marks = {};
+  jpgFiles.forEach(f => { state.marks[f.baseName] = 'pending'; });
+
+  // 更新标题
+  document.getElementById('toolbar-title').textContent = dirHandle.name + ' - 选片助手';
+
+  updateDisplayList();
+  renderThumbnails();
+  navigateTo(0);
+  updateStats();
+
+  // 后台异步加载所有EXIF
+  loadAllExif();
+
+  // 后台生成缩略图（不压缩模式不需要）
+  if (!state.thumbNoCompress) {
+    generateAllThumbnails();
   }
 }
 
@@ -258,38 +452,61 @@ async function getImageUrl(file) {
 
 // ===== 获取缩略图URL（带缓存+自动生成） =====
 async function getThumbnailUrl(file) {
+  // 不压缩模式：直接使用原图
+  if (state.thumbNoCompress) {
+    return await getImageUrl(file);
+  }
+
   // 1. 检查URL缓存
-  if (state.thumbUrlCache.has(file.baseName)) {
-    return state.thumbUrlCache.get(file.baseName);
+  const cacheKey = `${file.baseName}_${state.thumbSize}`;
+  if (state.thumbUrlCache.has(cacheKey)) {
+    return state.thumbUrlCache.get(cacheKey);
   }
 
   // 2. 检查是否正在生成
-  if (state.thumbGenInProgress.has(file.baseName)) {
-    return state.thumbGenInProgress.get(file.baseName);
+  if (state.thumbGenInProgress.has(cacheKey)) {
+    return state.thumbGenInProgress.get(cacheKey);
   }
 
   // 3. 开始生成
   const promise = generateThumbnailInternal(file);
-  state.thumbGenInProgress.set(file.baseName, promise);
+  state.thumbGenInProgress.set(cacheKey, promise);
 
   try {
     return await promise;
   } finally {
-    state.thumbGenInProgress.delete(file.baseName);
+    state.thumbGenInProgress.delete(cacheKey);
   }
 }
 
 async function generateThumbnailInternal(file) {
-  // 检查磁盘上是否已有缩略图
+  const thumbSize = state.thumbSize;
+  const thumbFileName = getThumbFileName(file.baseName, file.name, thumbSize);
+  const cacheKey = `${file.baseName}_${thumbSize}`;
+
+  // 检查磁盘上是否已有缩略图（新格式）
   if (state.thumbDirHandle) {
     try {
-      const thumbHandle = await state.thumbDirHandle.getFileHandle(file.name);
+      const thumbHandle = await state.thumbDirHandle.getFileHandle(thumbFileName);
       const thumbFile = await thumbHandle.getFile();
       const url = URL.createObjectURL(thumbFile);
-      state.thumbUrlCache.set(file.baseName, url);
+      state.thumbUrlCache.set(cacheKey, url);
       return url;
     } catch (e) {
-      // 不存在，继续生成
+      // 新格式不存在，继续检查旧格式
+    }
+
+    // 旧格式兼容：800px缩略图可能用原文件名存储
+    if (thumbSize === 800) {
+      try {
+        const thumbHandle = await state.thumbDirHandle.getFileHandle(file.name);
+        const thumbFile = await thumbHandle.getFile();
+        const url = URL.createObjectURL(thumbFile);
+        state.thumbUrlCache.set(cacheKey, url);
+        return url;
+      } catch (e) {
+        // 旧格式也不存在，继续生成
+      }
     }
   }
 
@@ -301,14 +518,14 @@ async function generateThumbnailInternal(file) {
     let w = img.naturalWidth;
     let h = img.naturalHeight;
     if (w > h) {
-      if (w > THUMB_MAX_EDGE) {
-        h = Math.round(h * THUMB_MAX_EDGE / w);
-        w = THUMB_MAX_EDGE;
+      if (w > thumbSize) {
+        h = Math.round(h * thumbSize / w);
+        w = thumbSize;
       }
     } else {
-      if (h > THUMB_MAX_EDGE) {
-        w = Math.round(w * THUMB_MAX_EDGE / h);
-        h = THUMB_MAX_EDGE;
+      if (h > thumbSize) {
+        w = Math.round(w * thumbSize / h);
+        h = thumbSize;
       }
     }
 
@@ -319,10 +536,10 @@ async function generateThumbnailInternal(file) {
 
     const blob = await new Promise(r => canvas.toBlob(r, 'image/jpeg', THUMB_QUALITY));
 
-    // 尝试写入磁盘
+    // 尝试写入磁盘（新格式文件名）
     if (state.thumbDirHandle) {
       try {
-        const thumbHandle = await state.thumbDirHandle.getFileHandle(file.name, { create: true });
+        const thumbHandle = await state.thumbDirHandle.getFileHandle(thumbFileName, { create: true });
         const writable = await thumbHandle.createWritable();
         await writable.write(blob);
         await writable.close();
@@ -332,7 +549,7 @@ async function generateThumbnailInternal(file) {
     }
 
     const url = URL.createObjectURL(blob);
-    state.thumbUrlCache.set(file.baseName, url);
+    state.thumbUrlCache.set(cacheKey, url);
     return url;
   } catch (e) {
     // 生成失败，回退到原图
@@ -565,6 +782,7 @@ function closeAllDialogs() {
   document.getElementById('dialog-match').style.display = 'none';
   document.getElementById('dialog-export').style.display = 'none';
   document.getElementById('dialog-settings').style.display = 'none';
+  document.getElementById('dialog-thumb-settings').style.display = 'none';
   document.querySelectorAll('.dropdown').forEach(d => d.style.display = 'none');
 }
 
@@ -963,10 +1181,33 @@ async function loadFileInfo(file) {
 
   // 加载缩略图文件大小
   try {
-    if (state.thumbDirHandle) {
-      const thumbHandle = await state.thumbDirHandle.getFileHandle(file.name);
-      const thumbFile = await thumbHandle.getFile();
-      document.getElementById('info-thumbsize').textContent = formatFileSize(thumbFile.size);
+    if (state.thumbNoCompress) {
+      document.getElementById('info-thumbsize').textContent = '不压缩（原图）';
+    } else if (state.thumbDirHandle) {
+      const thumbFileName = getThumbFileName(file.baseName, file.name, state.thumbSize);
+      let thumbFound = false;
+
+      // 先找新格式
+      try {
+        const thumbHandle = await state.thumbDirHandle.getFileHandle(thumbFileName);
+        const thumbFile = await thumbHandle.getFile();
+        document.getElementById('info-thumbsize').textContent = formatFileSize(thumbFile.size);
+        thumbFound = true;
+      } catch (e) {}
+
+      // 800px时兼容旧格式
+      if (!thumbFound && state.thumbSize === 800) {
+        try {
+          const thumbHandle = await state.thumbDirHandle.getFileHandle(file.name);
+          const thumbFile = await thumbHandle.getFile();
+          document.getElementById('info-thumbsize').textContent = formatFileSize(thumbFile.size);
+          thumbFound = true;
+        } catch (e) {}
+      }
+
+      if (!thumbFound) {
+        document.getElementById('info-thumbsize').textContent = '生成中...';
+      }
     } else {
       document.getElementById('info-thumbsize').textContent = '未生成';
     }
@@ -1189,6 +1430,14 @@ function openMatchDialog(selectedJpgs) {
     await copyRawFiles(state.matchedData.matched);
   };
 
+  document.getElementById('btn-export-copy-both').onclick = async () => {
+    if (!state.matchedData || state.matchedData.matched.length === 0) {
+      alert('没有匹配的文件可导出。');
+      return;
+    }
+    await copyJpgAndRawFiles(state.matchedData.matched);
+  };
+
   document.getElementById('btn-export-list').onclick = () => {
     if (!state.matchedData) {
       alert('请先选择RAW文件夹。');
@@ -1248,6 +1497,95 @@ async function copyRawFiles(matchedList) {
       <div style="color:var(--color-selected);">✓ 成功：${success.length}</div>
       ${failed.length > 0 ? `<div style="color:var(--color-deleted);">✗ 失败：${failed.length}</div>` : ''}
       <div style="margin-top:8px; color:var(--text-muted);">输出目录：${outDirHandle.name}</div>
+    `;
+
+    $btnDone.style.display = 'inline-block';
+    $btnDone.onclick = () => closeAllDialogs();
+
+  } catch (err) {
+    if (err.name !== 'AbortError') {
+      $result.style.display = 'block';
+      $result.innerHTML = `<div style="color:var(--color-deleted);">导出失败：${err.message}</div>`;
+      $btnDone.style.display = 'inline-block';
+      $btnDone.onclick = () => closeAllDialogs();
+    } else {
+      closeAllDialogs();
+    }
+  }
+}
+
+// ===== 复制JPG+RAW文件到输出文件夹 =====
+async function copyJpgAndRawFiles(matchedList) {
+  const $dialog = document.getElementById('dialog-export');
+  $dialog.style.display = 'flex';
+
+  const $progressBar = document.getElementById('export-progress-bar');
+  const $progressText = document.getElementById('export-progress-text');
+  const $result = document.getElementById('export-result');
+  const $btnDone = document.getElementById('btn-export-done');
+
+  $result.style.display = 'none';
+  $btnDone.style.display = 'none';
+
+  const total = matchedList.length * 2; // JPG + RAW 各一份
+
+  try {
+    const outDirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+
+    // 创建JPG和RAW子文件夹
+    const jpgOutDir = await outDirHandle.getDirectoryHandle('JPG', { create: true });
+    const rawOutDir = await outDirHandle.getDirectoryHandle('RAW', { create: true });
+
+    const success = [];
+    const failed = [];
+    let done = 0;
+
+    for (let i = 0; i < matchedList.length; i++) {
+      const item = matchedList[i];
+
+      // 复制JPG
+      try {
+        const jpgFile = await item.jpg.handle.getFile();
+        const jpgHandle = await jpgOutDir.getFileHandle(item.jpg.name, { create: true });
+        const jpgWritable = await jpgHandle.createWritable();
+        await jpgWritable.write(jpgFile);
+        await jpgWritable.close();
+        success.push(item.jpg.name);
+      } catch (err) {
+        console.error('复制JPG失败:', item.jpg.name, err);
+        failed.push({ name: item.jpg.name, error: err.message });
+      }
+
+      done++;
+      $progressBar.style.width = Math.round((done / total) * 100) + '%';
+      $progressText.textContent = `${done} / ${total}`;
+
+      // 复制RAW
+      try {
+        const rawFile = await item.raw.handle.getFile();
+        const rawHandle = await rawOutDir.getFileHandle(item.raw.name, { create: true });
+        const rawWritable = await rawHandle.createWritable();
+        await rawWritable.write(rawFile);
+        await rawWritable.close();
+        success.push(item.raw.name);
+      } catch (err) {
+        console.error('复制RAW失败:', item.raw.name, err);
+        failed.push({ name: item.raw.name, error: err.message });
+      }
+
+      done++;
+      $progressBar.style.width = Math.round((done / total) * 100) + '%';
+      $progressText.textContent = `${done} / ${total}`;
+    }
+
+    $progressBar.style.width = '100%';
+    $progressText.textContent = `${success.length} / ${total}`;
+
+    $result.style.display = 'block';
+    $result.innerHTML = `
+      <div style="color:var(--color-selected);">✓ 成功：${success.length}</div>
+      ${failed.length > 0 ? `<div style="color:var(--color-deleted);">✗ 失败：${failed.length}</div>` : ''}
+      <div style="margin-top:8px; color:var(--text-muted);">输出目录：${outDirHandle.name}/JPG 和 ${outDirHandle.name}/RAW</div>
     `;
 
     $btnDone.style.display = 'inline-block';
